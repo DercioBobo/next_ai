@@ -97,6 +97,28 @@ def get_tools(enable_write=False):
 		{
 			"type": "function",
 			"function": {
+				"name": "find_doctype",
+				"description": (
+					"Search for DocTypes by keyword when you are unsure of the exact name. "
+					"Always call this before concluding that something does not exist. "
+					"Users may use local-language terms, abbreviations, or partial names — "
+					"this tool finds the real DocType name and its current record count."
+				),
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"query": {
+							"type": "string",
+							"description": "Keyword to search for, e.g. 'posto', 'vigilancia', 'invoice', 'stock'"
+						}
+					},
+					"required": ["query"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
 				"name": "get_report",
 				"description": "Run a saved Frappe/ERPNext report and return its results.",
 				"parameters": {
@@ -183,6 +205,7 @@ def get_tools(enable_write=False):
 def execute_tool(tool_name, args):
 	"""Execute a named tool and return a JSON-serialisable result."""
 	handlers = {
+		"find_doctype":   _find_doctype,
 		"search_records": _search_records,
 		"get_record":     _get_record,
 		"get_schema":     _get_schema,
@@ -209,6 +232,76 @@ def execute_tool(tool_name, args):
 # ---------------------------------------------------------------------------
 # Individual tool implementations
 # ---------------------------------------------------------------------------
+
+def _find_doctype(query):
+	"""
+	Fuzzy-search DocTypes by keyword. Returns matches with live record counts.
+	Searches name and a normalised version (hyphens/underscores → spaces).
+	"""
+	q = query.lower().strip()
+
+	hits = frappe.db.sql("""
+		SELECT name, module, IFNULL(description, '') AS description, custom
+		FROM `tabDocType`
+		WHERE istable = 0
+		  AND issingle = 0
+		  AND module != 'Core'
+		  AND (
+			  LOWER(name)                              LIKE %(q)s
+			  OR LOWER(REPLACE(name, '-', ' '))        LIKE %(q)s
+			  OR LOWER(REPLACE(name, '_', ' '))        LIKE %(q)s
+			  OR LOWER(REPLACE(REPLACE(name,'-',' '),'_',' ')) LIKE %(q)s
+		  )
+		ORDER BY
+		  custom DESC,
+		  CASE WHEN LOWER(name) = %(exact)s THEN 0 ELSE 1 END,
+		  name
+		LIMIT 15
+	""", {"q": f"%{q}%", "exact": q}, as_dict=True)
+
+	# Word-by-word fallback when the full phrase doesn't match
+	if not hits:
+		words = [w for w in q.split() if len(w) > 2]
+		seen = set()
+		for word in words:
+			more = frappe.db.sql("""
+				SELECT name, module, custom
+				FROM `tabDocType`
+				WHERE istable = 0 AND issingle = 0 AND module != 'Core'
+				  AND LOWER(name) LIKE %(q)s
+				ORDER BY custom DESC, name
+				LIMIT 10
+			""", {"q": f"%{word}%"}, as_dict=True)
+			for row in more:
+				if row.name not in seen:
+					seen.add(row.name)
+					hits.append(row)
+
+	if not hits:
+		return {
+			"found": False,
+			"query": query,
+			"tip": "Try a shorter or different keyword. Run find_doctype again with a simpler term.",
+		}
+
+	matches = []
+	for h in hits:
+		entry = {
+			"doctype": h.name,
+			"module": h.get("module", ""),
+			"custom": bool(h.get("custom")),
+		}
+		try:
+			if frappe.has_permission(h.name, "read"):
+				entry["record_count"] = frappe.db.count(h.name)
+			else:
+				entry["record_count"] = "no permission"
+		except Exception:
+			entry["record_count"] = "unknown"
+		matches.append(entry)
+
+	return {"found": True, "query": query, "matches": matches}
+
 
 def _search_records(doctype, filters=None, fields=None, limit=20, order_by=None):
 	if not frappe.has_permission(doctype, "read"):

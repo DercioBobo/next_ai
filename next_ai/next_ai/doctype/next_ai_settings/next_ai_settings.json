@@ -14,6 +14,7 @@
   "chat_section",
   "enable_float_widget",
   "enable_write_actions",
+  "direct_mode",
   "col_break_2",
   "max_tool_calls",
   "advanced_section",
@@ -77,6 +78,13 @@
    "label": "Enable Write Actions",
    "default": "0",
    "description": "Allow the AI to create and update records. Enable only if you trust the prompts."
+  },
+  {
+   "fieldname": "direct_mode",
+   "fieldtype": "Check",
+   "label": "Direct Mode (No Background Worker)",
+   "default": "1",
+   "description": "ON — response runs inline in the web request. Works without bench worker / Redis / socket.io. Recommended for development or small teams.\nOFF — uses background queue + real-time streaming. Requires bench worker, Redis, and socket.io. Better for production with many concurrent users."
   },
   {
    "fieldname": "col_break_2",

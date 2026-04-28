@@ -16,10 +16,11 @@ frappe.pages["next-ai"].on_page_show = function (wrapper) {
 // ─────────────────────────────────────────────────────────────────────────────
 class NextAIPage {
 	constructor(wrapper) {
-		this.wrapper         = wrapper;
-		this.session_id      = null;
-		this.is_loading      = false;
-		this._current_stream = null;  // holds bubble refs + accumulated text
+		this.wrapper          = wrapper;
+		this.session_id       = null;
+		this.is_loading       = false;
+		this._current_stream  = null;   // holds bubble refs + accumulated text
+		this._stream_handler  = null;   // realtime listener (streaming mode only)
 
 		this._render();
 		this._bind();
@@ -215,7 +216,7 @@ class NextAIPage {
 		});
 	}
 
-	// ── Send (synchronous — no background worker required) ──────────────────
+	// ── Send ────────────────────────────────────────────────────────────────
 	send() {
 		if (this.is_loading) return;
 		const message = this.$input().val().trim();
@@ -228,11 +229,18 @@ class NextAIPage {
 		this._append_msg("user", message);
 		const { $bubble, $content, $tool_row, $actions } = this._create_stream_bubble();
 		this._current_stream = { $bubble, $content, $tool_row, $actions, raw_text: "" };
-
 		this.is_loading = true;
 		this._update_send();
 
-		// Show thinking indicator while waiting for the API response
+		if ((frappe.boot.next_ai || {}).direct_mode) {
+			this._send_direct(message, $content, $tool_row, $actions);
+		} else {
+			this._send_streaming(message, $content, $tool_row, $actions);
+		}
+	}
+
+	// ── Direct mode (sync — no worker/Redis/socket.io needed) ───────────────
+	_send_direct(message, $content, $tool_row, $actions) {
 		$tool_row.show();
 
 		frappe.call({
@@ -240,13 +248,11 @@ class NextAIPage {
 			args: { session_id: this.session_id || "new", message },
 
 			callback: (r) => {
-				// User hit stop while we were waiting
 				if (!this._current_stream) return;
-
 				$tool_row.hide();
 
 				if (!r.message) {
-					this._stream_error($bubble, $content, __("No response from server."));
+					this._stream_error($content, __("No response from server."));
 					this._reset_loading();
 					return;
 				}
@@ -254,12 +260,10 @@ class NextAIPage {
 				const { session_id, response } = r.message;
 				this.session_id = session_id;
 				this.load_sessions();
-
 				this._current_stream.raw_text = response;
 
-				// Animate the response in — gives a live feel without needing realtime
 				this._typewrite(response, $content, () => {
-					if (!this._current_stream) return;  // stopped mid-typewrite
+					if (!this._current_stream) return;
 					$content.html(_renderMd(response));
 					$actions.show();
 					this._scroll_bottom();
@@ -271,21 +275,101 @@ class NextAIPage {
 			error: () => {
 				if (!this._current_stream) return;
 				$tool_row.hide();
-				this._stream_error($bubble, $content, __("Request failed. Check the error log or verify your OpenAI API key in Settings."));
+				this._stream_error($content, __("Request failed. Check the error log or verify your OpenAI API key in Settings."));
 				this._reset_loading();
 			},
 		});
 	}
 
+	// ── Streaming mode (async — requires bench worker + Redis + socket.io) ──
+	_send_streaming(message, $content, $tool_row, $actions) {
+		frappe.call({
+			method: "next_ai.api.chat.send_message",
+			args: { session_id: this.session_id || "new", message },
+
+			callback: (r) => {
+				if (!this._current_stream) return;
+
+				if (!r.message) {
+					this._stream_error($content, __("No response from server."));
+					this._reset_loading();
+					return;
+				}
+
+				const { session_id, stream_key } = r.message;
+				this.session_id = session_id;
+				this.load_sessions();
+
+				let raw_text  = "";
+				let got_token = false;
+
+				if (this._stream_handler) {
+					frappe.realtime.off("next_ai_stream", this._stream_handler);
+				}
+
+				// If worker is missing the dots spin forever — surface a clear message
+				const timeout = setTimeout(() => {
+					if (!this.is_loading) return;
+					frappe.realtime.off("next_ai_stream", this._stream_handler);
+					this._stream_handler = null;
+					this._stream_error($content,
+						__("No response after 60 s. Make sure bench worker, Redis and socket.io are running. Or switch to Direct Mode in Settings.")
+					);
+					this._reset_loading();
+				}, 60000);
+
+				this._stream_handler = (data) => {
+					if (data.key !== stream_key) return;
+
+					if (data.token) {
+						if (!got_token) { $content.empty(); got_token = true; }
+						raw_text += data.token;
+						if (this._current_stream) this._current_stream.raw_text = raw_text;
+						$content.text(raw_text);
+						this._scroll_bottom();
+					}
+
+					if (data.tool_start) { $tool_row.show(); this._scroll_bottom(); }
+					if (data.tool_end)   { $tool_row.hide(); }
+
+					if (data.done) {
+						clearTimeout(timeout);
+						frappe.realtime.off("next_ai_stream", this._stream_handler);
+						this._stream_handler = null;
+						this._current_stream = null;
+
+						if (data.error) {
+							this._stream_error($content, data.error);
+						} else {
+							$content.html(_renderMd(raw_text || ""));
+							$actions.show();
+							this._scroll_bottom();
+							this.load_sessions();
+						}
+						this._reset_loading();
+					}
+				};
+
+				frappe.realtime.on("next_ai_stream", this._stream_handler);
+			},
+
+			error: () => {
+				if (!this._current_stream) return;
+				this._stream_error($content, __("Failed to send message. Please try again."));
+				this._reset_loading();
+			},
+		});
+	}
+
+	// ── Typewriter animation (direct mode) ───────────────────────────────────
 	_typewrite(text, $content, on_done) {
 		const chars = Array.from(text);
 		let i = 0;
 		let buf = "";
 		$content.empty();
 		const tick = () => {
-			if (!this.is_loading || !this._current_stream) return;  // stopped
+			if (!this.is_loading || !this._current_stream) return;
 			if (i >= chars.length) { on_done(); return; }
-			// ~4 chars per frame → fast but visibly animated
 			const end = Math.min(i + 4, chars.length);
 			buf += chars.slice(i, end).join("");
 			i = end;
@@ -300,6 +384,12 @@ class NextAIPage {
 	// silent=true when called from new_chat() — don't render into a cleared DOM
 	stop_stream(silent = false) {
 		if (!this.is_loading) return;
+
+		// Detach realtime listener if streaming mode was active
+		if (this._stream_handler) {
+			frappe.realtime.off("next_ai_stream", this._stream_handler);
+			this._stream_handler = null;
+		}
 
 		if (!silent) {
 			const s = this._current_stream;
@@ -318,7 +408,7 @@ class NextAIPage {
 			}
 		}
 
-		// Setting _current_stream to null also halts the typewriter loop
+		// Nulling _current_stream also halts the typewriter loop
 		this._current_stream = null;
 		this._reset_loading();
 	}
@@ -381,7 +471,7 @@ class NextAIPage {
 		};
 	}
 
-	_stream_error($bubble, $content, msg) {
+	_stream_error($content, msg) {
 		$content.html(
 			`<span class="nai-error-text">${frappe.utils.escape_html(msg)}</span>`
 		);

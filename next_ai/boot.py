@@ -9,10 +9,12 @@ def extend_bootinfo(bootinfo):
 			"float_enabled": bool(settings.enable_float_widget),
 			"model": settings.openai_model or "gpt-4o",
 			"api_configured": bool(settings.openai_api_key),
+			"direct_mode": bool(settings.direct_mode),
 		}
 	except Exception:
 		bootinfo.next_ai = {
 			"float_enabled": False,
 			"model": "gpt-4o",
 			"api_configured": False,
+			"direct_mode": True,
 		}

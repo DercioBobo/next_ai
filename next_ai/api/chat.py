@@ -166,6 +166,14 @@ def send_message_sync(session_id, message):
 
 
 @frappe.whitelist()
+def clear_doctype_cache():
+	"""Bust the doctype list cache — call after installing new custom doctypes."""
+	frappe.cache().delete_value("next_ai:doctype_list")
+	frappe.cache().delete_value("next_ai:doctype_list_v2")
+	return {"success": True}
+
+
+@frappe.whitelist()
 def test_openai_connection():
 	"""Quick connectivity check — called from Next AI Settings."""
 	settings = frappe.get_cached_doc("Next AI Settings")
@@ -507,32 +515,57 @@ def _build_system_prompt(settings, user=None):
 	except Exception:
 		company = "your company"
 
-	doctype_list = _get_doctype_list()
-	dt_summary = ", ".join(doctype_list[:100])
-	if len(doctype_list) > 100:
-		dt_summary += f" … and {len(doctype_list) - 100} more"
+	dt = _get_doctype_list()
 
-	prompt = f"""You are Next AI, an intelligent assistant embedded in ERPNext/Frappe.
-You help users understand their business data, query records, and navigate the ERP system through natural conversation.
+	custom_section = ""
+	if dt["custom"]:
+		custom_section = (
+			f"\nCUSTOM DocTypes (specific to this company — always check these first):\n"
+			+ ", ".join(dt["custom"])
+		)
+
+	standard_names = dt["standard"]
+	std_summary = ", ".join(standard_names[:120])
+	if len(standard_names) > 120:
+		std_summary += f" … and {len(standard_names) - 120} more"
+
+	prompt = f"""You are Next AI, an intelligent ERPNext/Frappe assistant.
+You help users understand their business data, query records, and navigate the system.
 
 Context:
 - Today: {frappe.utils.today()}
 - User: {user_name} ({user})
 - Company: {company}
+{custom_section}
 
-DocTypes available in this system:
-{dt_summary}
+Standard ERPNext/Frappe DocTypes:
+{std_summary}
 
-You have live tools to query the database. Always use them to fetch real data before making factual statements.
+━━━ CRITICAL RULES — follow these exactly ━━━
 
-Guidelines:
-- Use tools before stating facts about specific records or counts
-- Format data with markdown: tables for comparisons, bullet lists for enumerations
-- Include currency when showing monetary values
-- Use navigate_to and embed the URL as a markdown link when referencing a record
-- If initial filters yield no results, try broadening the search
-- Keep responses concise but complete
-- You only see data the current user is permitted to access"""
+1. ALWAYS use tools. Never state facts, counts, or record details without querying first.
+
+2. UNKNOWN DOCTYPE? → call find_doctype IMMEDIATELY.
+   - User says "posto" → call find_doctype("posto")
+   - User says "vigilância" → call find_doctype("vigilancia")
+   - User mentions anything not in your lists above → call find_doctype with that term
+   - Never assume something doesn't exist without calling find_doctype first.
+
+3. ZERO RESULTS from search_records or get_count?
+   → Before saying "no records", call find_doctype to confirm the DocType name is correct.
+   → Then try again with the confirmed name.
+
+4. LANGUAGE: Users may speak Portuguese, Spanish, or other languages.
+   Their words are often translations of DocType names. Always search.
+
+5. CUSTOM DOCTYPES take priority. If a user's term matches a custom DocType,
+   that is almost certainly what they mean.
+
+━━━ Response style ━━━
+- Markdown: tables for data, bullet lists for enumerations
+- Include currency symbols for monetary values
+- Embed navigate_to URLs as markdown links when referencing records
+- Be concise but complete"""
 
 	if settings.custom_system_prompt:
 		prompt += f"\n\nAdditional instructions:\n{settings.custom_system_prompt}"
@@ -541,17 +574,25 @@ Guidelines:
 
 
 def _get_doctype_list():
-	cache_key = "next_ai:doctype_list"
+	cache_key = "next_ai:doctype_list_v2"
 	cached = frappe.cache().get_value(cache_key)
 	if cached:
 		return cached
 
-	result = frappe.db.get_all(
+	custom = frappe.db.get_all(
 		"DocType",
-		filters={"istable": 0, "issingle": 0, "module": ["!=", "Core"]},
+		filters={"istable": 0, "issingle": 0, "custom": 1},
+		pluck="name",
+		order_by="name asc",
+	)
+	standard = frappe.db.get_all(
+		"DocType",
+		filters={"istable": 0, "issingle": 0, "custom": 0, "module": ["!=", "Core"]},
 		pluck="name",
 		order_by="name asc",
 		limit=500,
 	)
+
+	result = {"custom": custom, "standard": standard}
 	frappe.cache().set_value(cache_key, result, expires_in_sec=3600)
 	return result
