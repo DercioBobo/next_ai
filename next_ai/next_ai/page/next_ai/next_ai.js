@@ -16,10 +16,11 @@ frappe.pages["next-ai"].on_page_show = function (wrapper) {
 // ─────────────────────────────────────────────────────────────────────────────
 class NextAIPage {
 	constructor(wrapper) {
-		this.wrapper    = wrapper;
-		this.session_id = null;
-		this.is_loading = false;
+		this.wrapper        = wrapper;
+		this.session_id     = null;
+		this.is_loading     = false;
 		this._stream_handler = null;
+		this._current_stream = null;  // holds bubble refs + accumulated text
 
 		this._render();
 		this._bind();
@@ -81,7 +82,7 @@ class NextAIPage {
         <textarea id="nai-input" class="nai-textarea" rows="1"
           placeholder="${__("Ask anything about your ERP data…")}"></textarea>
         <button class="nai-send" id="nai-send" title="${__("Send")}">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+          ${_sendIcon()}
         </button>
       </div>
       <p class="nai-hint">${__("Enter to send · Shift+Enter for new line")}</p>
@@ -98,10 +99,17 @@ class NextAIPage {
 		});
 
 		this.$input().on("keydown", (e) => {
-			if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.send(); }
+			if (e.key === "Enter" && !e.shiftKey) {
+				e.preventDefault();
+				if (this.is_loading) this.stop_stream();
+				else this.send();
+			}
 		});
 
-		this.$send().on("click", () => this.send());
+		this.$send().on("click", () => {
+			if (this.is_loading) this.stop_stream();
+			else this.send();
+		});
 
 		this.$el("#nai-new-chat").on("click", () => this.new_chat());
 
@@ -221,6 +229,9 @@ class NextAIPage {
 		// Create the AI bubble that tokens will stream into
 		const { $bubble, $content, $tool_row, $actions } = this._create_stream_bubble();
 
+		// Store refs immediately so stop_stream() can access them
+		this._current_stream = { $bubble, $content, $tool_row, $actions, raw_text: "" };
+
 		this.is_loading = true;
 		this._update_send();
 
@@ -231,13 +242,14 @@ class NextAIPage {
 			callback: (r) => {
 				if (!r.message) {
 					this._stream_error($bubble, $content, __("No response from server."));
+					this._reset_loading();
 					return;
 				}
 
 				const { session_id, stream_key } = r.message;
 				this.session_id = session_id;
-				let raw_text   = "";
-				let got_token  = false;
+				let raw_text  = "";
+				let got_token = false;
 
 				// Clean up any previous listener
 				if (this._stream_handler) {
@@ -249,12 +261,12 @@ class NextAIPage {
 
 					if (data.token) {
 						if (!got_token) {
-							// Replace spinner with empty text area
 							$content.empty();
 							got_token = true;
 						}
 						raw_text += data.token;
-						// Show plain text while streaming (fast, no flicker)
+						// Keep current_stream in sync for stop_stream()
+						if (this._current_stream) this._current_stream.raw_text = raw_text;
 						$content.text(raw_text);
 						this._scroll_bottom();
 					}
@@ -271,19 +283,18 @@ class NextAIPage {
 					if (data.done) {
 						frappe.realtime.off("next_ai_stream", this._stream_handler);
 						this._stream_handler = null;
+						this._current_stream = null;
 
 						if (data.error) {
 							this._stream_error($bubble, $content, data.error);
 						} else {
-							// Render final markdown once the full text is in
 							$content.html(_renderMd(raw_text || ""));
 							$actions.show();
 							this._scroll_bottom();
 							this.load_sessions();
 						}
 
-						this.is_loading = false;
-						this._update_send();
+						this._reset_loading();
 					}
 				};
 
@@ -292,13 +303,45 @@ class NextAIPage {
 
 			error: () => {
 				this._stream_error($bubble, $content, __("Failed to send message. Please try again."));
-				this.is_loading = false;
-				this._update_send();
+				this._reset_loading();
 			},
 		});
 	}
 
+	// ── Stop / interrupt ─────────────────────────────────────────────────────
+	stop_stream() {
+		if (!this.is_loading) return;
+
+		if (this._stream_handler) {
+			frappe.realtime.off("next_ai_stream", this._stream_handler);
+			this._stream_handler = null;
+		}
+
+		const s = this._current_stream;
+		if (s) {
+			if (s.raw_text) {
+				s.$content.html(
+					_renderMd(s.raw_text) +
+					`<p class="nai-stopped-hint">${__("— generation stopped —")}</p>`
+				);
+			} else {
+				s.$content.html(
+					`<span class="nai-stopped-hint">${__("— stopped before response —")}</span>`
+				);
+			}
+			s.$actions.show();
+		}
+
+		this._current_stream = null;
+		this._reset_loading();
+	}
+
 	// ── DOM helpers ──────────────────────────────────────────────────────────
+	_reset_loading() {
+		this.is_loading = false;
+		this._update_send();
+	}
+
 	_append_msg(role, content) {
 		const is_user = role === "user";
 		const av = is_user
@@ -353,7 +396,7 @@ class NextAIPage {
 
 	_stream_error($bubble, $content, msg) {
 		$content.html(
-			`<span style="color:var(--red)">${frappe.utils.escape_html(msg)}</span>`
+			`<span class="nai-error-text">${frappe.utils.escape_html(msg)}</span>`
 		);
 	}
 
@@ -363,9 +406,20 @@ class NextAIPage {
 	}
 
 	_update_send() {
-		this.$send()
-			.prop("disabled", this.is_loading)
-			.toggleClass("loading", this.is_loading);
+		const $btn = this.$send();
+		if (this.is_loading) {
+			$btn
+				.prop("disabled", false)
+				.addClass("nai-send-stop")
+				.attr("title", __("Stop generation"))
+				.html(_stopIcon());
+		} else {
+			$btn
+				.prop("disabled", false)
+				.removeClass("nai-send-stop")
+				.attr("title", __("Send"))
+				.html(_sendIcon());
+		}
 	}
 }
 
@@ -398,8 +452,16 @@ function _renderMd(text) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Micro helpers
+// Icons
 // ─────────────────────────────────────────────────────────────────────────────
+function _sendIcon() {
+	return `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>`;
+}
+
+function _stopIcon() {
+	return `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="3"/></svg>`;
+}
+
 function _aiIcon() {
 	return `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M2 12h3M19 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12"/></svg>`;
 }
@@ -427,6 +489,7 @@ function _injectPageStyles() {
 	const s = document.createElement("style");
 	s.id = "nai-page-css";
 	s.textContent = `
+/* ── Layout shell ─────────────────────────────────────────── */
 .nai-page {
   display: flex;
   height: calc(100vh - 110px);
@@ -436,34 +499,53 @@ function _injectPageStyles() {
   border: 1px solid var(--border-color);
   background: var(--bg-color);
 }
+
+/* ── Sidebar ──────────────────────────────────────────────── */
 .nai-sidebar {
   width: 260px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  background: var(--subtle-bg);
+  background: #e8eaee;
   border-right: 1px solid var(--border-color);
   overflow: hidden;
 }
+/* Dark-mode override – Frappe uses data-theme-mode or .dark-theme */
+html[data-theme-mode="dark"] .nai-sidebar,
+body.dark-theme .nai-sidebar,
+[data-theme="dark"] .nai-sidebar { background: #1a1d2e; }
+
 .nai-sidebar-top { padding: 12px; }
+
 .nai-new-btn {
   display: flex; align-items: center; gap: 6px;
   width: 100%; padding: 8px 12px;
-  border: 1px solid var(--border-color); border-radius: 8px;
-  background: var(--bg-color); color: var(--text-color);
-  font-size: 13px; cursor: pointer; transition: background 0.15s;
+  border: 1px solid rgba(99,102,241,0.3); border-radius: 8px;
+  background: rgba(99,102,241,0.08); color: #6366f1;
+  font-size: 13px; font-weight: 500; cursor: pointer; transition: background 0.15s;
 }
-.nai-new-btn:hover { background: var(--control-bg); }
+.nai-new-btn:hover { background: rgba(99,102,241,0.15); }
+
 .nai-sessions { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
 .nai-empty-hint { font-size: 12px; color: var(--text-muted); text-align: center; padding: 20px 8px; }
+
 .nai-session-item {
   position: relative; padding: 9px 32px 9px 10px;
   border-radius: 8px; cursor: pointer; margin-bottom: 2px; transition: background 0.12s;
 }
-.nai-session-item:hover  { background: var(--control-bg); }
-.nai-session-item.active { background: var(--highlight-color, #e8e6ff); }
-.nai-session-title { display: block; font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-color); }
-.nai-session-meta  { display: block; font-size: 11px; color: var(--text-muted); margin-top: 1px; }
+.nai-session-item:hover  { background: rgba(0,0,0,0.06); }
+html[data-theme-mode="dark"] .nai-session-item:hover,
+body.dark-theme .nai-session-item:hover { background: rgba(255,255,255,0.07); }
+.nai-session-item.active { background: rgba(99,102,241,0.18); }
+
+.nai-session-title {
+  display: block; font-size: 13px; font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--text-color);
+}
+.nai-session-item.active .nai-session-title { color: #6366f1; }
+.nai-session-meta { display: block; font-size: 11px; color: var(--text-muted); margin-top: 1px; }
+
 .nai-session-del {
   position: absolute; top: 50%; right: 8px; transform: translateY(-50%);
   display: none; background: none; border: none; cursor: pointer;
@@ -471,10 +553,16 @@ function _injectPageStyles() {
 }
 .nai-session-item:hover .nai-session-del { display: block; }
 .nai-session-del:hover { color: var(--red); }
+
 .nai-sidebar-footer { padding: 10px 12px; border-top: 1px solid var(--border-color); }
-.nai-settings-link { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-muted); text-decoration: none; }
+.nai-settings-link {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text-muted); text-decoration: none;
+}
 .nai-settings-link:hover { color: var(--text-color); }
-.nai-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+
+/* ── Main chat area ───────────────────────────────────────── */
+.nai-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; background: var(--bg-color); }
 .nai-welcome { flex: 1; display: flex; align-items: center; justify-content: center; overflow-y: auto; }
 .nai-welcome-inner { text-align: center; max-width: 520px; padding: 24px; }
 .nai-welcome-logo { margin-bottom: 16px; }
@@ -485,11 +573,14 @@ function _injectPageStyles() {
   padding: 7px 14px; border: 1px solid var(--border-color); border-radius: 20px;
   background: var(--bg-color); font-size: 13px; cursor: pointer; color: var(--text-color); transition: all 0.12s;
 }
-.nai-chip:hover { border-color: #6366f1; color: #6366f1; background: #f0f0ff; }
+.nai-chip:hover { border-color: #6366f1; color: #6366f1; background: rgba(99,102,241,0.06); }
+
+/* ── Messages ─────────────────────────────────────────────── */
 .nai-messages { flex: 1; overflow-y: auto; padding: 20px 20px 8px; display: flex; flex-direction: column; gap: 16px; }
 .nai-msg { display: flex; align-items: flex-start; gap: 10px; max-width: 85%; }
 .nai-msg-user { align-self: flex-end; flex-direction: row-reverse; }
 .nai-msg-ai   { align-self: flex-start; }
+
 .nai-av {
   width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
@@ -499,10 +590,27 @@ function _injectPageStyles() {
 .nai-av-user { background: var(--primary); color: white; overflow: hidden; }
 .nai-av-user img  { width: 100%; height: 100%; object-fit: cover; }
 .nai-av-user span { font-size: 13px; font-weight: 600; }
-.nai-bubble { padding: 10px 14px; border-radius: 14px; font-size: 14px; line-height: 1.6; word-break: break-word; }
-.nai-msg-user .nai-bubble { background: #6366f1; color: white; border-bottom-right-radius: 4px; }
-.nai-msg-ai  .nai-bubble  { background: var(--subtle-bg); border: 1px solid var(--border-color); border-bottom-left-radius: 4px; min-width: 120px; }
+
+/* User bubble – indigo pill */
+.nai-msg-user .nai-bubble {
+  padding: 10px 14px; border-radius: 14px; border-bottom-right-radius: 4px;
+  font-size: 14px; line-height: 1.6; word-break: break-word;
+  background: #6366f1; color: white;
+}
+
+/* AI bubble – white card, clearly distinct from gray sidebar */
+.nai-msg-ai .nai-bubble {
+  padding: 10px 14px; border-radius: 14px; border-bottom-left-radius: 4px;
+  font-size: 14px; line-height: 1.6; word-break: break-word;
+  background: var(--card-bg, #ffffff);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.07);
+  min-width: 120px;
+}
+
 .nai-tool-row { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+
+/* Markdown content */
 .nai-content h2 { font-size: 15px; font-weight: 600; margin: 12px 0 6px; }
 .nai-content h3, .nai-content h4 { font-size: 14px; font-weight: 600; margin: 10px 0 4px; }
 .nai-content p  { margin: 0 0 8px; }
@@ -517,25 +625,47 @@ function _injectPageStyles() {
 .nai-content th { background: var(--control-bg); font-weight: 600; }
 .nai-content tr:nth-child(even) { background: var(--subtle-bg); }
 .nai-content a { color: #6366f1; text-decoration: underline; }
+
 .nai-bubble-actions { margin-top: 6px; display: flex; gap: 6px; }
 .nai-copy { background: none; border: none; cursor: pointer; color: var(--text-muted); padding: 2px; line-height: 1; }
 .nai-copy:hover { color: var(--text-color); }
+
+/* Stopped / error indicators */
+.nai-stopped-hint { font-size: 11px; color: var(--text-muted); margin: 8px 0 0; font-style: italic; }
+.nai-error-text { color: var(--red); }
+
+/* Loading dots */
 .nai-dots { display: flex; gap: 5px; padding: 4px 2px; }
 .nai-dots span { width: 7px; height: 7px; background: var(--text-muted); border-radius: 50%; animation: nai-bounce 1.2s infinite; }
 .nai-dots span:nth-child(2) { animation-delay: 0.2s; }
 .nai-dots span:nth-child(3) { animation-delay: 0.4s; }
 @keyframes nai-bounce { 0%,60%,100% { transform: translateY(0); } 30% { transform: translateY(-6px); } }
-.nai-input-bar { padding: 12px 20px 16px; border-top: 1px solid var(--border-color); }
+
+/* ── Input bar ────────────────────────────────────────────── */
+.nai-input-bar { padding: 12px 20px 16px; border-top: 1px solid var(--border-color); background: var(--bg-color); }
 .nai-input-wrap {
   display: flex; align-items: flex-end; gap: 8px;
   background: var(--control-bg); border: 1px solid var(--border-color);
   border-radius: 12px; padding: 8px 8px 8px 14px; transition: border-color 0.15s;
 }
 .nai-input-wrap:focus-within { border-color: #6366f1; }
-.nai-textarea { flex: 1; border: none; background: transparent; resize: none; outline: none; font-size: 14px; line-height: 1.5; max-height: 160px; overflow-y: auto; color: var(--text-color); }
-.nai-send { width: 34px; height: 34px; border-radius: 8px; border: none; background: #6366f1; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; transition: background 0.15s, opacity 0.15s; }
-.nai-send:hover    { background: #4f46e5; }
+.nai-textarea {
+  flex: 1; border: none; background: transparent; resize: none; outline: none;
+  font-size: 14px; line-height: 1.5; max-height: 160px; overflow-y: auto; color: var(--text-color);
+}
+
+/* Send button – indigo; becomes red stop button while streaming */
+.nai-send {
+  width: 34px; height: 34px; border-radius: 8px; border: none;
+  background: #6366f1; color: white;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; flex-shrink: 0; transition: background 0.15s;
+}
+.nai-send:hover { background: #4f46e5; }
 .nai-send:disabled { opacity: 0.5; cursor: not-allowed; }
+.nai-send.nai-send-stop { background: #ef4444; }
+.nai-send.nai-send-stop:hover { background: #dc2626; }
+
 .nai-hint { font-size: 11px; color: var(--text-muted); text-align: center; margin: 6px 0 0; }
 `;
 	document.head.appendChild(s);

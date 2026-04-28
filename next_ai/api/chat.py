@@ -115,6 +115,35 @@ def delete_session(session_id):
 
 
 @frappe.whitelist()
+def test_openai_connection():
+	"""Quick connectivity check — called from Next AI Settings."""
+	settings = frappe.get_cached_doc("Next AI Settings")
+	if not settings.openai_api_key:
+		frappe.throw(
+			_("OpenAI API key is not configured. Add it in Next AI Settings first."),
+			frappe.ValidationError,
+		)
+
+	try:
+		from openai import OpenAI
+		client = OpenAI(api_key=settings.get_password("openai_api_key"))
+		# Lightweight call: list available models
+		models_page = client.models.list()
+		gpt_models = sorted(
+			{m.id for m in models_page.data if m.id.startswith("gpt")},
+			reverse=True,
+		)
+		preview = ", ".join(gpt_models[:6]) or "none found"
+		return {
+			"success": True,
+			"model": settings.openai_model or "gpt-4o",
+			"available_gpt_models": preview,
+		}
+	except Exception as exc:
+		frappe.throw(str(exc), frappe.ValidationError)
+
+
+@frappe.whitelist()
 def clear_session(session_id):
 	session = frappe.get_doc("AI Chat Session", session_id)
 	if session.user != frappe.session.user:
