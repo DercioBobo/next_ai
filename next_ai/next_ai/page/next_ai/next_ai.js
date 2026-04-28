@@ -19,9 +19,7 @@ class NextAIPage {
 		this.wrapper         = wrapper;
 		this.session_id      = null;
 		this.is_loading      = false;
-		this._stream_handler = null;
 		this._current_stream = null;  // holds bubble refs + accumulated text
-		this._timeout_id     = null;  // guards against hung background jobs
 
 		this._render();
 		this._bind();
@@ -217,7 +215,7 @@ class NextAIPage {
 		});
 	}
 
-	// ── Send & streaming ─────────────────────────────────────────────────────
+	// ── Send (synchronous — no background worker required) ──────────────────
 	send() {
 		if (this.is_loading) return;
 		const message = this.$input().val().trim();
@@ -228,119 +226,80 @@ class NextAIPage {
 		this.$msgs().show();
 
 		this._append_msg("user", message);
-
-		// Create the AI bubble that tokens will stream into
 		const { $bubble, $content, $tool_row, $actions } = this._create_stream_bubble();
-
-		// Store refs immediately so stop_stream() can access them
 		this._current_stream = { $bubble, $content, $tool_row, $actions, raw_text: "" };
 
 		this.is_loading = true;
 		this._update_send();
 
+		// Show thinking indicator while waiting for the API response
+		$tool_row.show();
+
 		frappe.call({
-			method: "next_ai.api.chat.send_message",
+			method: "next_ai.api.chat.send_message_sync",
 			args: { session_id: this.session_id || "new", message },
 
 			callback: (r) => {
+				// User hit stop while we were waiting
+				if (!this._current_stream) return;
+
+				$tool_row.hide();
+
 				if (!r.message) {
 					this._stream_error($bubble, $content, __("No response from server."));
 					this._reset_loading();
 					return;
 				}
 
-				const { session_id, stream_key } = r.message;
+				const { session_id, response } = r.message;
 				this.session_id = session_id;
-
-				// Show session in sidebar immediately — don't wait for streaming to finish
 				this.load_sessions();
 
-				let raw_text  = "";
-				let got_token = false;
+				this._current_stream.raw_text = response;
 
-				// Clean up any previous listener
-				if (this._stream_handler) {
-					frappe.realtime.off("next_ai_stream", this._stream_handler);
-				}
-
-				// Safety net: if the background worker is not running or Redis/socketio
-				// is unavailable, the dots would spin forever. Surface a clear error.
-				this._timeout_id = setTimeout(() => {
-					if (!this.is_loading) return;
-					frappe.realtime.off("next_ai_stream", this._stream_handler);
-					this._stream_handler = null;
-					this._stream_error($bubble, $content,
-						__("No response after 45 seconds. Make sure the Frappe worker is running: bench worker") +
-						(got_token ? "" : __(" — also check that Redis and socket.io are running."))
-					);
+				// Animate the response in — gives a live feel without needing realtime
+				this._typewrite(response, $content, () => {
+					if (!this._current_stream) return;  // stopped mid-typewrite
+					$content.html(_renderMd(response));
+					$actions.show();
+					this._scroll_bottom();
+					this._current_stream = null;
 					this._reset_loading();
-				}, 45000);
-
-				this._stream_handler = (data) => {
-					if (data.key !== stream_key) return;
-
-					if (data.token) {
-						if (!got_token) {
-							$content.empty();
-							got_token = true;
-						}
-						raw_text += data.token;
-						// Keep current_stream in sync for stop_stream()
-						if (this._current_stream) this._current_stream.raw_text = raw_text;
-						$content.text(raw_text);
-						this._scroll_bottom();
-					}
-
-					if (data.tool_start) {
-						$tool_row.show();
-						this._scroll_bottom();
-					}
-
-					if (data.tool_end) {
-						$tool_row.hide();
-					}
-
-					if (data.done) {
-						clearTimeout(this._timeout_id);
-						this._timeout_id = null;
-						frappe.realtime.off("next_ai_stream", this._stream_handler);
-						this._stream_handler = null;
-						this._current_stream = null;
-
-						if (data.error) {
-							this._stream_error($bubble, $content, data.error);
-						} else {
-							$content.html(_renderMd(raw_text || ""));
-							$actions.show();
-							this._scroll_bottom();
-							this.load_sessions();
-						}
-
-						this._reset_loading();
-					}
-				};
-
-				frappe.realtime.on("next_ai_stream", this._stream_handler);
+				});
 			},
 
 			error: () => {
-				this._stream_error($bubble, $content, __("Failed to send message. Please try again."));
+				if (!this._current_stream) return;
+				$tool_row.hide();
+				this._stream_error($bubble, $content, __("Request failed. Check the error log or verify your OpenAI API key in Settings."));
 				this._reset_loading();
 			},
 		});
 	}
 
+	_typewrite(text, $content, on_done) {
+		const chars = Array.from(text);
+		let i = 0;
+		let buf = "";
+		$content.empty();
+		const tick = () => {
+			if (!this.is_loading || !this._current_stream) return;  // stopped
+			if (i >= chars.length) { on_done(); return; }
+			// ~4 chars per frame → fast but visibly animated
+			const end = Math.min(i + 4, chars.length);
+			buf += chars.slice(i, end).join("");
+			i = end;
+			$content.text(buf);
+			this._scroll_bottom();
+			requestAnimationFrame(tick);
+		};
+		requestAnimationFrame(tick);
+	}
+
 	// ── Stop / interrupt ─────────────────────────────────────────────────────
-	// silent=true when called from new_chat() — don't try to render into a cleared DOM
+	// silent=true when called from new_chat() — don't render into a cleared DOM
 	stop_stream(silent = false) {
 		if (!this.is_loading) return;
-
-		if (this._timeout_id) { clearTimeout(this._timeout_id); this._timeout_id = null; }
-
-		if (this._stream_handler) {
-			frappe.realtime.off("next_ai_stream", this._stream_handler);
-			this._stream_handler = null;
-		}
 
 		if (!silent) {
 			const s = this._current_stream;
@@ -348,24 +307,24 @@ class NextAIPage {
 				if (s.raw_text) {
 					s.$content.html(
 						_renderMd(s.raw_text) +
-						`<p class="nai-stopped-hint">${__("— generation stopped —")}</p>`
+						`<p class="nai-stopped-hint">${__("— stopped —")}</p>`
 					);
 				} else {
 					s.$content.html(
-						`<span class="nai-stopped-hint">${__("— stopped before response —")}</span>`
+						`<span class="nai-stopped-hint">${__("— stopped —")}</span>`
 					);
 				}
 				s.$actions.show();
 			}
 		}
 
+		// Setting _current_stream to null also halts the typewriter loop
 		this._current_stream = null;
 		this._reset_loading();
 	}
 
 	// ── DOM helpers ──────────────────────────────────────────────────────────
 	_reset_loading() {
-		if (this._timeout_id) { clearTimeout(this._timeout_id); this._timeout_id = null; }
 		this.is_loading = false;
 		this._update_send();
 	}

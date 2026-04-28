@@ -115,6 +115,57 @@ def delete_session(session_id):
 
 
 @frappe.whitelist()
+def send_message_sync(session_id, message):
+	"""
+	Synchronous variant — runs the full AI loop inline in the web worker.
+	No background queue, no Redis, no socket.io needed. Works out of the box.
+	"""
+	settings = frappe.get_cached_doc("Next AI Settings")
+	if not settings.openai_api_key:
+		frappe.throw(_("OpenAI API key is not configured."), frappe.ValidationError)
+
+	if not session_id or session_id == "new":
+		session = _create_session(message)
+	else:
+		session = frappe.get_doc("AI Chat Session", session_id)
+		if session.user != frappe.session.user and not frappe.has_permission(
+			"AI Chat Session", "write", doc=session_id
+		):
+			frappe.throw(_("Access denied."), frappe.PermissionError)
+
+	_save_message(session.name, "User", message)
+
+	history = json.loads(session.messages_json or "[]")
+	history.append({"role": "user", "content": message})
+	session.messages_json = json.dumps(history, ensure_ascii=False)
+	session.last_message_at = frappe.utils.now_datetime()
+	session.message_count = (session.message_count or 0) + 1
+	session.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	client = OpenAI(api_key=settings.get_password("openai_api_key"))
+	system_prompt = _build_system_prompt(settings, frappe.session.user)
+
+	response_text, tokens = _run_ai_loop_sync(client, history, system_prompt, settings)
+
+	_save_message(session.name, "Assistant", response_text, tokens)
+
+	history.append({"role": "assistant", "content": response_text})
+	if len(history) > 40:
+		history = history[-40:]
+	session.messages_json = json.dumps(history, ensure_ascii=False)
+	session.save(ignore_permissions=True)
+	frappe.db.commit()
+
+	return {
+		"session_id": session.name,
+		"session_title": session.session_title,
+		"response": response_text,
+		"tokens": tokens,
+	}
+
+
+@frappe.whitelist()
 def test_openai_connection():
 	"""Quick connectivity check — called from Next AI Settings."""
 	settings = frappe.get_cached_doc("Next AI Settings")
@@ -223,6 +274,73 @@ def _process_ai_message(session_id, stream_key, user):
 # ---------------------------------------------------------------------------
 # AI streaming loop
 # ---------------------------------------------------------------------------
+
+def _run_ai_loop_sync(client, history, system_prompt, settings):
+	"""Non-streaming AI loop — runs in the web request, no realtime needed."""
+	messages = [{"role": "system", "content": system_prompt}] + history
+	tools = get_tools(bool(settings.enable_write_actions))
+	cap = min(int(settings.max_tool_calls or 5), 10)
+	total_tokens = 0
+
+	for iteration in range(cap + 1):
+		resp = client.chat.completions.create(
+			model=settings.openai_model or "gpt-4o",
+			messages=messages,
+			tools=tools,
+			tool_choice="auto",
+			max_tokens=int(settings.max_tokens or 4096),
+			temperature=float(settings.temperature or 0.3),
+		)
+
+		if resp.usage:
+			total_tokens += resp.usage.total_tokens
+
+		choice = resp.choices[0]
+		full_content = choice.message.content or ""
+		tool_calls_obj = choice.message.tool_calls or []
+
+		if not tool_calls_obj:
+			history.append({"role": "assistant", "content": full_content})
+			return full_content, total_tokens
+
+		tool_calls_data = [
+			{
+				"id": tc.id,
+				"type": "function",
+				"function": {"name": tc.function.name, "arguments": tc.function.arguments},
+			}
+			for tc in tool_calls_obj
+		]
+		assistant_msg = {
+			"role": "assistant",
+			"content": full_content or None,
+			"tool_calls": tool_calls_data,
+		}
+		messages.append(assistant_msg)
+		history.append(assistant_msg)
+
+		for tc in tool_calls_data:
+			try:
+				args = json.loads(tc["function"]["arguments"])
+			except json.JSONDecodeError:
+				args = {}
+			result = execute_tool(tc["function"]["name"], args)
+			tool_msg = {
+				"role": "tool",
+				"tool_call_id": tc["id"],
+				"content": json.dumps(result, ensure_ascii=False, default=str),
+			}
+			messages.append(tool_msg)
+			history.append(tool_msg)
+
+		if iteration == cap:
+			messages.append({
+				"role": "user",
+				"content": "Please provide your final response based on the information gathered.",
+			})
+
+	return "Could not complete within the allowed steps. Please try again.", total_tokens
+
 
 def _run_ai_loop_streaming(client, history, system_prompt, settings, stream_key, user):
 	"""
