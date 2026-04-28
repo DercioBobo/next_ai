@@ -1,9 +1,11 @@
+import re
 from setuptools import setup, find_packages
 
 with open("requirements.txt") as f:
     install_requires = f.read().strip().split("\n")
 
-from next_ai import __version__ as version
+with open("next_ai/__init__.py") as f:
+    version = re.search(r'__version__ = ["\']([^"\']+)["\']', f.read()).group(1)
 
 setup(
 	name="next_ai",
