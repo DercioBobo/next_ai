@@ -1,5 +1,6 @@
 import frappe
 import json
+import uuid
 from frappe import _
 from openai import OpenAI
 
@@ -7,14 +8,15 @@ from next_ai.api.tools import get_tools, execute_tool
 
 
 # ---------------------------------------------------------------------------
-# Public API endpoints
+# Public API
 # ---------------------------------------------------------------------------
 
 @frappe.whitelist()
 def send_message(session_id, message):
 	"""
-	Process a user message and return the AI response.
-	Creates a new session if session_id == 'new'.
+	Save the user message immediately, enqueue the AI job, and return a
+	stream_key. The client listens on frappe.realtime for 'next_ai_stream'
+	events keyed on that stream_key. Returns in ~50ms — does not hold a worker.
 	"""
 	settings = frappe.get_cached_doc("Next AI Settings")
 
@@ -23,8 +25,6 @@ def send_message(session_id, message):
 			_("OpenAI API key is not configured. Please add it in Next AI Settings."),
 			frappe.ValidationError,
 		)
-
-	client = OpenAI(api_key=settings.get_password("openai_api_key"))
 
 	# Resolve session
 	if not session_id or session_id == "new":
@@ -36,41 +36,40 @@ def send_message(session_id, message):
 		):
 			frappe.throw(_("Access denied."), frappe.PermissionError)
 
-	# Load history and append new user turn
-	history = json.loads(session.messages_json or "[]")
-	history.append({"role": "user", "content": message})
-
-	# Persist the user message for the display log
+	# Persist user message immediately so it shows up if the page refreshes
 	_save_message(session.name, "User", message)
 
-	# Run AI conversation loop
-	system_prompt = _build_system_prompt(settings)
-	response_text, tokens = _run_ai_loop(client, history, system_prompt, settings)
-
-	# Persist AI response for the display log
-	_save_message(session.name, "Assistant", response_text, tokens)
-
-	# Keep history bounded to last 40 messages to manage token cost
-	if len(history) > 40:
-		history = history[-40:]
-
+	# Extend conversation history
+	history = json.loads(session.messages_json or "[]")
+	history.append({"role": "user", "content": message})
 	session.messages_json = json.dumps(history, ensure_ascii=False)
 	session.last_message_at = frappe.utils.now_datetime()
 	session.message_count = (session.message_count or 0) + 1
 	session.save(ignore_permissions=True)
 	frappe.db.commit()
 
+	# Unique key the frontend uses to filter its own stream
+	stream_key = f"nai_{uuid.uuid4().hex[:16]}"
+
+	# Enqueue — runs in a background worker, completely separate from web workers
+	frappe.enqueue(
+		"next_ai.api.chat._process_ai_message",
+		queue="default",
+		timeout=180,
+		session_id=session.name,
+		stream_key=stream_key,
+		user=frappe.session.user,
+	)
+
 	return {
 		"session_id": session.name,
 		"session_title": session.session_title or message[:60],
-		"response": response_text,
-		"tokens_used": tokens,
+		"stream_key": stream_key,
 	}
 
 
 @frappe.whitelist()
 def get_sessions():
-	"""Return the current user's chat sessions, most recent first."""
 	return frappe.get_list(
 		"AI Chat Session",
 		filters={"user": frappe.session.user},
@@ -82,7 +81,6 @@ def get_sessions():
 
 @frappe.whitelist()
 def get_messages(session_id):
-	"""Return display messages for a session."""
 	session = frappe.get_doc("AI Chat Session", session_id)
 	if session.user != frappe.session.user and not frappe.has_permission(
 		"AI Chat Session", "read"
@@ -104,7 +102,6 @@ def get_messages(session_id):
 
 @frappe.whitelist()
 def delete_session(session_id):
-	"""Delete a session and all its messages."""
 	session = frappe.get_doc("AI Chat Session", session_id)
 	if session.user != frappe.session.user and not frappe.has_permission(
 		"AI Chat Session", "delete"
@@ -119,7 +116,6 @@ def delete_session(session_id):
 
 @frappe.whitelist()
 def clear_session(session_id):
-	"""Clear all messages from a session but keep the session itself."""
 	session = frappe.get_doc("AI Chat Session", session_id)
 	if session.user != frappe.session.user:
 		frappe.throw(_("Access denied."), frappe.PermissionError)
@@ -133,7 +129,196 @@ def clear_session(session_id):
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Background job (runs in a separate worker — never blocks web workers)
+# ---------------------------------------------------------------------------
+
+def _process_ai_message(session_id, stream_key, user):
+	"""
+	Entry point for the enqueued job. Runs the AI loop, streams tokens via
+	frappe.publish_realtime, then saves the complete response to the DB.
+	"""
+	try:
+		settings = frappe.get_cached_doc("Next AI Settings")
+		client = OpenAI(api_key=settings.get_password("openai_api_key"))
+
+		session = frappe.get_doc("AI Chat Session", session_id)
+		history = json.loads(session.messages_json or "[]")
+
+		system_prompt = _build_system_prompt(settings, user)
+
+		response_text, tokens = _run_ai_loop_streaming(
+			client, history, system_prompt, settings, stream_key, user
+		)
+
+		# Save complete response for history / page refresh
+		_save_message(session_id, "Assistant", response_text, tokens)
+
+		# Trim and persist updated history
+		if len(history) > 40:
+			history = history[-40:]
+		session.messages_json = json.dumps(history, ensure_ascii=False)
+		session.save(ignore_permissions=True)
+		frappe.db.commit()
+
+		# Signal the frontend that the stream is finished
+		frappe.publish_realtime(
+			event="next_ai_stream",
+			message={
+				"key": stream_key,
+				"done": True,
+				"session_id": session_id,
+				"session_title": session.session_title,
+				"tokens_used": tokens,
+			},
+			user=user,
+			after_commit=False,
+		)
+
+	except Exception:
+		frappe.log_error(title="Next AI streaming error", message=frappe.get_traceback())
+		frappe.publish_realtime(
+			event="next_ai_stream",
+			message={
+				"key": stream_key,
+				"done": True,
+				"error": "An error occurred while processing your request. Check the error log.",
+			},
+			user=user,
+			after_commit=False,
+		)
+
+
+# ---------------------------------------------------------------------------
+# AI streaming loop
+# ---------------------------------------------------------------------------
+
+def _run_ai_loop_streaming(client, history, system_prompt, settings, stream_key, user):
+	"""
+	Call OpenAI with stream=True. Push text tokens via publish_realtime as they
+	arrive. Execute tool calls (non-streaming) between turns, then stream the
+	final answer.
+	"""
+	messages = [{"role": "system", "content": system_prompt}] + history
+	tools = get_tools(bool(settings.enable_write_actions))
+	cap = min(int(settings.max_tool_calls or 5), 10)
+	total_tokens = 0
+
+	for iteration in range(cap + 1):
+		full_content = ""
+		tool_calls_raw = {}
+
+		stream = client.chat.completions.create(
+			model=settings.openai_model or "gpt-4o",
+			messages=messages,
+			tools=tools,
+			tool_choice="auto",
+			max_tokens=int(settings.max_tokens or 4096),
+			temperature=float(settings.temperature or 0.3),
+			stream=True,
+			stream_options={"include_usage": True},
+		)
+
+		for chunk in stream:
+			# Usage-only chunk arrives last when stream_options include_usage=True
+			if not chunk.choices:
+				if chunk.usage:
+					total_tokens += chunk.usage.total_tokens
+				continue
+
+			delta = chunk.choices[0].delta
+
+			# ── Text token ────────────────────────────────────────────────
+			if delta.content:
+				full_content += delta.content
+				frappe.publish_realtime(
+					event="next_ai_stream",
+					message={"key": stream_key, "token": delta.content, "done": False},
+					user=user,
+					after_commit=False,
+				)
+
+			# ── Tool call chunks (accumulate across chunks) ───────────────
+			if delta.tool_calls:
+				for tc_delta in delta.tool_calls:
+					i = tc_delta.index
+					if i not in tool_calls_raw:
+						tool_calls_raw[i] = {"id": "", "name": "", "arguments": ""}
+					if tc_delta.id:
+						tool_calls_raw[i]["id"] = tc_delta.id
+					if tc_delta.function:
+						if tc_delta.function.name:
+							tool_calls_raw[i]["name"] += tc_delta.function.name
+						if tc_delta.function.arguments:
+							tool_calls_raw[i]["arguments"] += tc_delta.function.arguments
+
+		# ── No tool calls → final response ───────────────────────────────
+		if not tool_calls_raw:
+			history.append({"role": "assistant", "content": full_content})
+			return full_content, total_tokens
+
+		# ── Tool calls present ────────────────────────────────────────────
+		tool_calls_data = [
+			{
+				"id": tool_calls_raw[i]["id"],
+				"type": "function",
+				"function": {
+					"name": tool_calls_raw[i]["name"],
+					"arguments": tool_calls_raw[i]["arguments"],
+				},
+			}
+			for i in sorted(tool_calls_raw.keys())
+		]
+
+		assistant_msg = {
+			"role": "assistant",
+			"content": full_content or None,
+			"tool_calls": tool_calls_data,
+		}
+		messages.append(assistant_msg)
+		history.append(assistant_msg)
+
+		# Tell the frontend the AI is now querying data
+		frappe.publish_realtime(
+			event="next_ai_stream",
+			message={"key": stream_key, "tool_start": True, "done": False},
+			user=user,
+			after_commit=False,
+		)
+
+		for tc in tool_calls_data:
+			try:
+				args = json.loads(tc["function"]["arguments"])
+			except json.JSONDecodeError:
+				args = {}
+
+			result = execute_tool(tc["function"]["name"], args)
+			tool_msg = {
+				"role": "tool",
+				"tool_call_id": tc["id"],
+				"content": json.dumps(result, ensure_ascii=False, default=str),
+			}
+			messages.append(tool_msg)
+			history.append(tool_msg)
+
+		frappe.publish_realtime(
+			event="next_ai_stream",
+			message={"key": stream_key, "tool_end": True, "done": False},
+			user=user,
+			after_commit=False,
+		)
+
+		# Force final answer after hitting the cap
+		if iteration == cap:
+			messages.append({
+				"role": "user",
+				"content": "Please provide your final response based on the information gathered.",
+			})
+
+	return "Could not complete within the allowed steps. Please try again.", total_tokens
+
+
+# ---------------------------------------------------------------------------
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _create_session(first_message):
@@ -158,9 +343,8 @@ def _save_message(session_id, role, content, tokens=None):
 	msg.insert(ignore_permissions=True)
 
 
-def _build_system_prompt(settings):
-	"""Compose the AI system prompt with live ERP context."""
-	user = frappe.session.user
+def _build_system_prompt(settings, user=None):
+	user = user or frappe.session.user
 	try:
 		user_name = frappe.get_cached_doc("User", user).full_name or user
 	except Exception:
@@ -207,7 +391,6 @@ Guidelines:
 
 
 def _get_doctype_list():
-	"""Cached list of queryable (non-table, non-single) doctypes."""
 	cache_key = "next_ai:doctype_list"
 	cached = frappe.cache().get_value(cache_key)
 	if cached:
@@ -222,79 +405,3 @@ def _get_doctype_list():
 	)
 	frappe.cache().set_value(cache_key, result, expires_in_sec=3600)
 	return result
-
-
-def _run_ai_loop(client, history, system_prompt, settings):
-	"""
-	Send messages to OpenAI, execute any tool calls, and loop until
-	a final text response is produced or the tool-call cap is reached.
-	"""
-	messages = [{"role": "system", "content": system_prompt}] + history
-	tools = get_tools(bool(settings.enable_write_actions))
-	cap = min(int(settings.max_tool_calls or 5), 10)
-	total_tokens = 0
-
-	for iteration in range(cap + 1):
-		response = client.chat.completions.create(
-			model=settings.openai_model or "gpt-4o",
-			messages=messages,
-			tools=tools,
-			tool_choice="auto",
-			max_tokens=int(settings.max_tokens or 4096),
-			temperature=float(settings.temperature or 0.3),
-		)
-
-		choice = response.choices[0]
-		if response.usage:
-			total_tokens += response.usage.total_tokens
-
-		# ── Final text response ──────────────────────────────────────────
-		if choice.finish_reason == "stop" or not choice.message.tool_calls:
-			final = choice.message.content or ""
-			history.append({"role": "assistant", "content": final})
-			return final, total_tokens
-
-		# ── Tool calls ───────────────────────────────────────────────────
-		tool_calls_data = [
-			{
-				"id": tc.id,
-				"type": "function",
-				"function": {
-					"name": tc.function.name,
-					"arguments": tc.function.arguments,
-				},
-			}
-			for tc in choice.message.tool_calls
-		]
-
-		assistant_msg = {
-			"role": "assistant",
-			"content": choice.message.content,
-			"tool_calls": tool_calls_data,
-		}
-		messages.append(assistant_msg)
-		history.append(assistant_msg)
-
-		for tc in choice.message.tool_calls:
-			try:
-				args = json.loads(tc.function.arguments)
-			except json.JSONDecodeError:
-				args = {}
-
-			result = execute_tool(tc.function.name, args)
-			tool_msg = {
-				"role": "tool",
-				"tool_call_id": tc.id,
-				"content": json.dumps(result, ensure_ascii=False, default=str),
-			}
-			messages.append(tool_msg)
-			history.append(tool_msg)
-
-		# After hitting the cap, ask for a final answer
-		if iteration == cap:
-			messages.append({
-				"role": "user",
-				"content": "Please provide your final response based on the information gathered.",
-			})
-
-	return "I was unable to complete the request within the allowed steps. Please try again.", total_tokens
