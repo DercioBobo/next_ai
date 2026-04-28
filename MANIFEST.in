@@ -1,0 +1,2 @@
+include requirements.txt
+recursive-include next_ai *.json *.js *.css *.html *.txt *.png *.jpg *.svg *.ico

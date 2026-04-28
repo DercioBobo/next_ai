@@ -1,0 +1,144 @@
+{
+ "actions": [],
+ "creation": "2024-01-01 00:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "openai_section",
+  "openai_api_key",
+  "openai_model",
+  "col_break_1",
+  "max_tokens",
+  "temperature",
+  "chat_section",
+  "enable_float_widget",
+  "enable_write_actions",
+  "col_break_2",
+  "max_tool_calls",
+  "advanced_section",
+  "custom_system_prompt",
+  "cache_section",
+  "schema_last_updated",
+  "refresh_schema_cache"
+ ],
+ "fields": [
+  {
+   "fieldname": "openai_section",
+   "fieldtype": "Section Break",
+   "label": "OpenAI Configuration"
+  },
+  {
+   "fieldname": "openai_api_key",
+   "fieldtype": "Password",
+   "label": "OpenAI API Key"
+  },
+  {
+   "fieldname": "openai_model",
+   "fieldtype": "Select",
+   "label": "Model",
+   "options": "gpt-4o\ngpt-4o-mini\ngpt-4-turbo\ngpt-4\ngpt-3.5-turbo",
+   "default": "gpt-4o",
+   "reqd": 1
+  },
+  {
+   "fieldname": "col_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "max_tokens",
+   "fieldtype": "Int",
+   "label": "Max Response Tokens",
+   "default": "4096",
+   "description": "Maximum tokens the AI can use in a single response"
+  },
+  {
+   "fieldname": "temperature",
+   "fieldtype": "Float",
+   "label": "Temperature",
+   "default": "0.3",
+   "description": "0 = precise/deterministic · 1 = creative/varied"
+  },
+  {
+   "fieldname": "chat_section",
+   "fieldtype": "Section Break",
+   "label": "Chat Settings"
+  },
+  {
+   "fieldname": "enable_float_widget",
+   "fieldtype": "Check",
+   "label": "Enable Floating Chat Widget",
+   "default": "1",
+   "description": "Show a floating AI chat button on every ERPNext page"
+  },
+  {
+   "fieldname": "enable_write_actions",
+   "fieldtype": "Check",
+   "label": "Enable Write Actions",
+   "default": "0",
+   "description": "Allow the AI to create and update records. Enable only if you trust the prompts."
+  },
+  {
+   "fieldname": "col_break_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "max_tool_calls",
+   "fieldtype": "Int",
+   "label": "Max Tool Calls per Message",
+   "default": "5",
+   "description": "Caps AI reasoning steps per response to control API cost and latency"
+  },
+  {
+   "fieldname": "advanced_section",
+   "fieldtype": "Section Break",
+   "label": "Advanced",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "custom_system_prompt",
+   "fieldtype": "Long Text",
+   "label": "Additional System Instructions",
+   "description": "Extra instructions appended to the default AI system prompt"
+  },
+  {
+   "fieldname": "cache_section",
+   "fieldtype": "Section Break",
+   "label": "Schema Cache",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "schema_last_updated",
+   "fieldtype": "Datetime",
+   "label": "Cache Last Refreshed",
+   "read_only": 1
+  },
+  {
+   "fieldname": "refresh_schema_cache",
+   "fieldtype": "Button",
+   "label": "Refresh Now"
+  }
+ ],
+ "issingle": 1,
+ "modified": "2024-01-01 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Next AI",
+ "name": "Next AI Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "export": 0,
+   "print": 1,
+   "read": 1,
+   "report": 0,
+   "role": "System Manager",
+   "share": 0,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC"
+}
