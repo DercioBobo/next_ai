@@ -129,11 +129,14 @@ def test_openai_connection():
 		client = OpenAI(api_key=settings.get_password("openai_api_key"))
 		# Lightweight call: list available models
 		models_page = client.models.list()
-		gpt_models = sorted(
-			{m.id for m in models_page.data if m.id.startswith("gpt")},
+		chat_models = sorted(
+			{
+				m.id for m in models_page.data
+				if m.id.startswith("gpt") and "realtime" not in m.id and "audio" not in m.id
+			},
 			reverse=True,
 		)
-		preview = ", ".join(gpt_models[:6]) or "none found"
+		preview = ", ".join(chat_models[:6]) or "none found"
 		return {
 			"success": True,
 			"model": settings.openai_model or "gpt-4o",
