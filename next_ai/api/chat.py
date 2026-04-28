@@ -567,6 +567,20 @@ Standard ERPNext/Frappe DocTypes:
 - Embed navigate_to URLs as markdown links when referencing records
 - Be concise but complete"""
 
+	# Curated ERPNext APIs the AI should know about by default
+	prompt += """
+
+━━━ Built-in ERPNext APIs (call via call_api) ━━━
+erpnext.accounts.utils.get_balance_on(account, date, party_type, party) — GL account balance on a date
+erpnext.stock.utils.get_stock_balance(item_code, warehouse, posting_date, posting_time) — stock qty/value
+erpnext.accounts.utils.get_outstanding_invoices(party_type, party, account) — unpaid invoice list
+frappe.client.get_value(doctype, filters, fieldname) — fetch a single field value
+frappe.client.get_list(doctype, fields, filters, limit) — lightweight list query
+Use search_app_apis(query) to discover more methods from installed apps."""
+
+	if settings.custom_api_context:
+		prompt += f"\n\n━━━ Custom app APIs for this installation ━━━\n{settings.custom_api_context}"
+
 	if settings.custom_system_prompt:
 		prompt += f"\n\nAdditional instructions:\n{settings.custom_system_prompt}"
 

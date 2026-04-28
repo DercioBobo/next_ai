@@ -134,6 +134,62 @@ def get_tools(enable_write=False):
 		{
 			"type": "function",
 			"function": {
+				"name": "call_api",
+				"description": (
+					"Call any whitelisted Frappe/ERPNext API method directly. "
+					"Use this to access real business logic and computed values — things raw DB queries cannot give you. "
+					"Examples: account balances, stock availability, payroll figures, custom app calculations. "
+					"Prefer this over search_records when a dedicated API exists for the calculation."
+				),
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"method": {
+							"type": "string",
+							"description": (
+								"Full Python dotted path to the whitelisted method. "
+								"Examples: 'erpnext.accounts.utils.get_balance_on', "
+								"'erpnext.stock.utils.get_stock_balance', "
+								"'myapp.api.get_monthly_summary'"
+							)
+						},
+						"kwargs": {
+							"type": "object",
+							"description": "Keyword arguments for the method. Match the method's parameter names exactly."
+						}
+					},
+					"required": ["method"]
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
+				"name": "search_app_apis",
+				"description": (
+					"Discover whitelisted API methods available in installed Frappe apps. "
+					"Use this when you need a computed value and want to find if a dedicated API exists. "
+					"Filter by app name or keyword to narrow results."
+				),
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"query": {
+							"type": "string",
+							"description": "Keyword to search for in method names, e.g. 'balance', 'stock', 'payroll'"
+						},
+						"app": {
+							"type": "string",
+							"description": "Optional: restrict search to a specific app, e.g. 'erpnext', 'hrms', 'myapp'"
+						}
+					},
+					"required": []
+				}
+			}
+		},
+		{
+			"type": "function",
+			"function": {
 				"name": "navigate_to",
 				"description": (
 					"Generate a navigation URL to a record or list view. "
@@ -205,8 +261,10 @@ def get_tools(enable_write=False):
 def execute_tool(tool_name, args):
 	"""Execute a named tool and return a JSON-serialisable result."""
 	handlers = {
-		"find_doctype":   _find_doctype,
-		"search_records": _search_records,
+		"find_doctype":    _find_doctype,
+		"call_api":        _call_api,
+		"search_app_apis": _search_app_apis,
+		"search_records":  _search_records,
 		"get_record":     _get_record,
 		"get_schema":     _get_schema,
 		"get_count":      _get_count,
@@ -232,6 +290,112 @@ def execute_tool(tool_name, args):
 # ---------------------------------------------------------------------------
 # Individual tool implementations
 # ---------------------------------------------------------------------------
+
+def _call_api(method, kwargs=None):
+	"""Call a whitelisted Frappe/ERPNext method by its full Python path."""
+	kwargs = kwargs or {}
+
+	# Resolve the function
+	try:
+		func = frappe.get_attr(method)
+	except AttributeError:
+		return {"error": f"Method not found: '{method}'. Use search_app_apis to discover available methods."}
+
+	# Must be explicitly whitelisted
+	if not getattr(func, "whitelisted", False):
+		return {"error": f"'{method}' is not a @frappe.whitelist() method and cannot be called."}
+
+	try:
+		result = func(**kwargs)
+		return {"method": method, "result": result}
+	except TypeError as exc:
+		return {"error": f"Wrong parameters for {method}: {exc}"}
+	except frappe.PermissionError as exc:
+		return {"error": f"Permission denied: {exc}"}
+	except Exception as exc:
+		frappe.log_error(title=f"Next AI – call_api: {method}", message=frappe.get_traceback())
+		return {"error": str(exc)}
+
+
+def _search_app_apis(query=None, app=None):
+	"""
+	Scan installed apps for @frappe.whitelist() methods.
+	Results are cached for 10 minutes per app.
+	"""
+	import os, re
+
+	q = (query or "").lower()
+	target_apps = [app] if app else [
+		a for a in frappe.get_installed_apps() if a != "frappe"
+	]
+
+	whitelist_re = re.compile(r"@frappe\.whitelist\s*\(")
+	def_re       = re.compile(r"^def\s+(\w+)\s*\(([^)]*)\)")
+
+	all_methods = []
+	for app_name in target_apps[:6]:
+		cache_key = f"next_ai:apis:{app_name}"
+		cached = frappe.cache().get_value(cache_key)
+		if cached is not None:
+			all_methods.extend(cached)
+			continue
+
+		try:
+			app_path = frappe.get_app_path(app_name)
+		except Exception:
+			continue
+
+		app_methods = []
+		for root, dirs, files in os.walk(app_path):
+			dirs[:] = [d for d in dirs if d not in (
+				"__pycache__", ".git", "node_modules", "public", "www", "templates"
+			)]
+			for fname in files:
+				if not fname.endswith(".py"):
+					continue
+				fpath = os.path.join(root, fname)
+				try:
+					with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
+						lines = fh.readlines()
+				except Exception:
+					continue
+
+				i = 0
+				while i < len(lines):
+					if whitelist_re.search(lines[i]):
+						for j in range(i + 1, min(i + 5, len(lines))):
+							m = def_re.match(lines[j].strip())
+							if m:
+								func_name = m.group(1)
+								params    = m.group(2).strip()
+								rel = os.path.relpath(fpath, os.path.dirname(app_path))
+								module = rel.replace(os.sep, ".").removesuffix(".py")
+								app_methods.append({
+									"method": f"{module}.{func_name}",
+									"params": params,
+									"app": app_name,
+								})
+								break
+					i += 1
+
+			if len(app_methods) > 300:
+				break
+
+		frappe.cache().set_value(cache_key, app_methods, expires_in_sec=600)
+		all_methods.extend(app_methods)
+
+	# Filter by query
+	if q:
+		filtered = [m for m in all_methods if q in m["method"].lower()]
+	else:
+		filtered = all_methods
+
+	return {
+		"total_found": len(filtered),
+		"methods": filtered[:40],
+		"tip": "Use call_api with the exact 'method' string shown here.",
+	}
+
 
 def _find_doctype(query):
 	"""

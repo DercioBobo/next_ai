@@ -19,6 +19,7 @@
   "max_tool_calls",
   "advanced_section",
   "custom_system_prompt",
+  "custom_api_context",
   "cache_section",
   "schema_last_updated",
   "refresh_schema_cache"
@@ -108,6 +109,12 @@
    "fieldtype": "Long Text",
    "label": "Additional System Instructions",
    "description": "Extra instructions appended to the default AI system prompt"
+  },
+  {
+   "fieldname": "custom_api_context",
+   "fieldtype": "Long Text",
+   "label": "Custom API Documentation",
+   "description": "Document your app's whitelisted methods here so the AI knows when and how to call them. Plain text or markdown. Example:\n\nmyapp.api.get_guard_roster(posto, date) — returns the duty roster for a given Posto de Vigilancia on a date\nmyapp.billing.get_monthly_revenue(month, year) — returns total billed revenue for the month"
   },
   {
    "fieldname": "cache_section",
