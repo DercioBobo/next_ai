@@ -8,6 +8,7 @@
   "openai_section",
   "openai_api_key",
   "openai_model",
+  "model_hint_html",
   "col_break_1",
   "max_tokens",
   "temperature",
@@ -39,9 +40,14 @@
    "fieldname": "openai_model",
    "fieldtype": "Select",
    "label": "Model",
-   "options": "gpt-4o\ngpt-4o-mini\ngpt-4-turbo\ngpt-4\ngpt-3.5-turbo",
-   "default": "gpt-4o",
+   "options": "gpt-4.1-mini\ngpt-4.1\ngpt-4.1-nano\ngpt-4o\ngpt-4o-mini\ngpt-4-turbo\ngpt-4\ngpt-3.5-turbo",
+   "default": "gpt-4.1-mini",
    "reqd": 1
+  },
+  {
+   "fieldname": "model_hint_html",
+   "fieldtype": "HTML",
+   "label": "Model Hint"
   },
   {
    "fieldname": "col_break_1",
